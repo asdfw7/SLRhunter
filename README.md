@@ -47,8 +47,11 @@ bedcov=sdr-results/k31.kmer.mat
 pheno=phenotype.txt
 N=`head $pheno -n1 | awk '{print NF}'`
 ns=`seq 1 $N`
+pre0=`basename $bedcov`.lm
+
 for n in $ns
 do
+	pre=$pre0.n$n
 	gemma -g $bedcov.geno$g -a $bedcov.snps -p $pheno -lm 1 -n $n -o $pre 
 done
 
