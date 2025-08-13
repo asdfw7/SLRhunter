@@ -744,7 +744,7 @@ def kmc_matrix(dbs, samples=None, outMat=None, bin='matrixer',  overwrite=False)
 			else:
 				fout.write('')
 		dbfiles = ['{}.kmc_*'.format(db) for db in dbs]
-		cmd = '{bin} {input} | pigz >> {output} && touch {ckp_file} && xrm {dbfiles}'.format(
+		cmd = '{bin} {input} | pigz >> {output} && touch {ckp_file} && rm {dbfiles}'.format(
 			bin=bin, input=input, output=outMat, ckp_file=ckp_file, dbfiles=' '.join(dbfiles))
 		run_cmd(cmd, log=True)
 
