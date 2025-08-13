@@ -23,10 +23,9 @@ setup(
         "biopython>=1.79",
         "xopen>=1.0.0",
         "numpy>=1.20",
-        "panda>=1.3",
+        "pandas>=1.3",
         "scipy>=1.7.0",
-        "psutil>=7.0.0",
-        "kmc>=3.2.4"
+        "psutil>=7.0.0"
     ]
     scripts=[
         "bin/matrixer"
