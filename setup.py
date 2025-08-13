@@ -26,7 +26,7 @@ setup(
         "scipy>=1.7.0",
         "psutil>=7.0.0"
     ],
-    scripts=glob.glob('bin/*') + glob.glob('src/*'),
+    scripts=[],
     entry_points={
         'console_scripts': [
                         'slrhunter = slrhunter.__main__:main',
