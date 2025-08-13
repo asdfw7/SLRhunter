@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-from soi.__version__ import version
+from slrhunter.__version__ import version
 
 from setuptools import setup, find_packages
 from distutils.extension import Extension
@@ -19,10 +19,21 @@ setup(
     python_requires='>=3.7',
     packages=find_packages(),
     include_package_data=True,
-    scripts=[],
+    install_requires=[
+        "biopython>=1.79",
+        "xopen>=1.0.0",
+        "numpy>=1.20",
+        "panda>=1.3",
+        "scipy>=1.7.0",
+        "psutil>=7.0.0",
+        "kmc>=3.2.4"
+    ]
+    scripts=[
+        "bin/matrixer"
+    ],
     entry_points={
         'console_scripts': [
-			'slrhunter = slrhunter.__main__',
+                        'slrhunter = slrhunter.__main__:main',
         ],
     },
 )
