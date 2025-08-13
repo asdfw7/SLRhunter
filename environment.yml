@@ -2,11 +2,9 @@ name: slrhunter
 channels: [conda-forge, bioconda]
 dependencies:
   - python=3.7
-  - pip
   - kmc
-  - kmc-tools
-  - minimap2
+  - bwa
+  - pandepth
   - gemma
-  - pigz
   - pip:
       - .
