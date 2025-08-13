@@ -7,7 +7,6 @@ from distutils.extension import Extension
 with open('README.md') as f:
     long_description = f.read()
 
-
 setup(
     name='slrhunter',
     version=version,
@@ -26,13 +25,11 @@ setup(
         "pandas>=1.3",
         "scipy>=1.7.0",
         "psutil>=7.0.0"
-    ]
-    scripts=[
-        "bin/matrixer"
     ],
+    scripts=glob.glob('bin/*') + glob.glob('src/*'),
     entry_points={
         'console_scripts': [
                         'slrhunter = slrhunter.__main__:main',
-        ],
-    },
+        ]
+    }
 )
