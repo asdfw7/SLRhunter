@@ -2,10 +2,10 @@
 ```
 git clone https://github.com/zhangrengang/SLRhunter
 cd SLRhunter
+conda env create -f environment.yml
+conda activate slrhunter
 
 # install
-pip3 install .
-
 chmod +x bin/* /src/*
 export PATH=$PATH:`pwd`/bin/:`pwd`/src/
 
