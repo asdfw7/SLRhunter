@@ -26,7 +26,9 @@ setup(
         "scipy>=1.7.0",
         "psutil>=7.0.0"
     ],
-    scripts=[],
+    scripts=[
+        'bin/matrixer',
+    ],
     entry_points={
         'console_scripts': [
                         'slrhunter = slrhunter.__main__:main',
