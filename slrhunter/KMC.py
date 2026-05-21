@@ -1113,13 +1113,12 @@ def resolve_matrixer(bin='matrixer'):
 	"""Resolve the matrixer executable without requiring manual PATH edits."""
 	if os.path.isabs(bin) and os.path.exists(bin):
 		return bin
+	local_bin = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'bin', 'matrixer')
+	if os.path.exists(local_bin):
+		return local_bin
 	found = shutil.which(bin)
 	if found:
 		return found
-	package_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-	local_bin = os.path.join(package_root, 'bin', 'matrixer')
-	if os.path.exists(local_bin):
-		return local_bin
 	return bin
 		
 def _filter_kmer(arg):
