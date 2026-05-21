@@ -18,6 +18,9 @@ setup(
     python_requires='>=3.7',
     packages=find_packages(),
     include_package_data=True,
+    package_data={
+        'slrhunter': ['bin/matrixer'],
+    },
     install_requires=[
         "biopython>=1.79",
         "xopen>=1.0.0",
@@ -26,12 +29,10 @@ setup(
         "scipy>=1.7.0",
         "psutil>=7.0.0"
     ],
-    scripts=[
-        'bin/matrixer',
-    ],
     entry_points={
         'console_scripts': [
                         'slrhunter = slrhunter.__main__:main',
+                        'matrixer = slrhunter.matrixer:main',
         ]
     }
 )

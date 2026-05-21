@@ -6,7 +6,6 @@ conda env create -f environment.yml
 conda activate slrhunter
 
 # install
-chmod +x bin/* /src/*
 pip install -e .
 
 ```
