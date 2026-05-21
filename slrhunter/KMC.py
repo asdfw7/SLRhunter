@@ -1,7 +1,9 @@
 import sys,os
-from collections import OrderedDict,Counter
+import shutil
+from collections import OrderedDict,Counter,defaultdict
 import numpy as np
 from Bio.Seq import Seq
+from Bio import SeqIO
 from scipy import stats
 from xopen import xopen as open
 from .RunCmdsMP import run_cmd, logger, pool_func, run_job
@@ -227,6 +229,278 @@ class KmerMatrix:
 		logger.info('Total kmers: {}; After filter: {} ({:.2%});'.format(
 				i, j, j/i, ))
 		return 
+	def to_specific_fasta(self, d_groups, prefix, groups=None, presence_cut=0.0,
+			present_prop=0.70, absent_prop=0.10, gzip_out=False, progress=1000000):
+		"""
+		Export group-specific k-mers as FASTA directly from a k-mer matrix.
+
+		A k-mer is written to group A when its presence proportion in group A is
+		greater than or equal to `present_prop` and its presence proportion in the
+		opposite group is less than or equal to `absent_prop`.
+		"""
+		if groups is None:
+			groups = list(d_groups.keys())
+		groups = list(groups)
+		if len(groups) != 2:
+			raise ValueError('`to_specific_fasta` requires exactly 2 groups, got {}'.format(groups))
+		group_a, group_b = groups
+		if group_a not in d_groups or group_b not in d_groups:
+			raise ValueError('Unknown group label(s): {}'.format(groups))
+
+		def _safe_name(name):
+			return str(name).replace('\\', '_').replace('/', '_').replace(' ', '_')
+
+		suffix = '.gz' if gzip_out else ''
+		out_a = '{}.{}_specific.fa{}'.format(prefix, _safe_name(group_a), suffix)
+		out_b = '{}.{}_specific.fa{}'.format(prefix, _safe_name(group_b), suffix)
+		out_a_list = '{}.{}_specific.list{}'.format(prefix, _safe_name(group_a), suffix)
+		out_b_list = '{}.{}_specific.list{}'.format(prefix, _safe_name(group_b), suffix)
+
+		samples = None
+		idx_a = idx_b = None
+		missing = []
+		scanned = 0
+		a_n = 0
+		b_n = 0
+		bad_rows = 0
+
+		logger.info('Generating group-specific FASTA from `{}`'.format(self.matfile))
+		logger.info('Groups: {} vs {}'.format(group_a, group_b))
+		logger.info('Thresholds: presence_cut={}, present>= {}, absent<= {}'.format(
+			presence_cut, present_prop, absent_prop))
+
+		with open(out_a, 'w') as fo_a, open(out_b, 'w') as fo_b, \
+				open(out_a_list, 'w') as fl_a, open(out_b_list, 'w') as fl_b:
+			for line, samples in self:
+				if idx_a is None:
+					sample_index = {sample: i for i, sample in enumerate(samples)}
+					missing = [sample for sample in d_groups[group_a] if sample not in sample_index]
+					missing += [sample for sample in d_groups[group_b] if sample not in sample_index]
+					if missing:
+						raise ValueError('Samples from design file were not found in matrix header: {}'.format(missing))
+					idx_a = [sample_index[sample] for sample in d_groups[group_a]]
+					idx_b = [sample_index[sample] for sample in d_groups[group_b]]
+				if not line:
+					continue
+				parts = line.strip().split()
+				if len(parts) < 1 + len(samples):
+					bad_rows += 1
+					continue
+				row = KmerMatrixLine(line=line, samples=samples)
+				kmer = row.seq
+
+				a_present = 0
+				for idx in idx_a:
+					try:
+						if float(row.freqs[idx]) > presence_cut:
+							a_present += 1
+					except (TypeError, ValueError, IndexError):
+						pass
+				b_present = 0
+				for idx in idx_b:
+					try:
+						if float(row.freqs[idx]) > presence_cut:
+							b_present += 1
+					except (TypeError, ValueError, IndexError):
+						pass
+
+				a_prop = a_present / float(len(idx_a))
+				b_prop = b_present / float(len(idx_b))
+
+				if a_prop >= present_prop and b_prop <= absent_prop:
+					fo_a.write('>{0}\n{0}\n'.format(kmer))
+					fl_a.write(kmer + '\n')
+					a_n += 1
+				elif b_prop >= present_prop and a_prop <= absent_prop:
+					fo_b.write('>{0}\n{0}\n'.format(kmer))
+					fl_b.write(kmer + '\n')
+					b_n += 1
+
+				scanned += 1
+				if progress and scanned % progress == 0:
+					logger.info('Scanned {} kmers; {} specific to {}; {} specific to {}'.format(
+						scanned, a_n, group_a, b_n, group_b))
+
+		logger.info('Scanned kmers: {}'.format(scanned))
+		if bad_rows:
+			logger.info('Bad rows skipped: {}'.format(bad_rows))
+		logger.info('{}-specific kmers: {}'.format(group_a, a_n))
+		logger.info('{}-specific kmers: {}'.format(group_b, b_n))
+		return out_a, out_b, out_a_list, out_b_list
+	def infer_sex_system(self, d_groups, prefix, groups=None, fdr=0.05,
+			min_sig_kmers=20, bootstrap=1000, seed=1):
+		"""
+		Infer XY/ZW support from k-mer presence/absence patterns.
+
+		The method uses Fisher's exact test on a 2x2 table for each k-mer and
+		controls the false discovery rate with Benjamini-Hochberg correction.
+		"""
+		if groups is None:
+			groups = list(d_groups.keys())
+		groups = list(groups)
+		if len(groups) != 2:
+			raise ValueError('`infer_sex_system` requires exactly 2 groups, got {}'.format(groups))
+		group_a, group_b = groups
+		if group_a not in d_groups or group_b not in d_groups:
+			raise ValueError('Unknown group label(s): {}'.format(groups))
+
+		def _safe_name(name):
+			return str(name).replace('\\', '_').replace('/', '_').replace(' ', '_')
+
+		def _looks_male(name):
+			name = str(name).strip().lower()
+			return name in {'male', 'm', 'xy', '1'} or name.startswith('male') or name.startswith('xy')
+
+		def _looks_female(name):
+			name = str(name).strip().lower()
+			return name in {'female', 'f', 'zw', '0'} or name.startswith('female') or name.startswith('zw')
+
+		def _system_from_support(supported_group):
+			if _looks_male(group_a) and _looks_female(group_b):
+				return 'XY' if supported_group == group_a else 'ZW'
+			if _looks_female(group_a) and _looks_male(group_b):
+				return 'ZW' if supported_group == group_a else 'XY'
+			if _looks_male(supported_group):
+				return 'XY'
+			if _looks_female(supported_group):
+				return 'ZW'
+			# Fallback: interpret the first provided group as the first sex class.
+			return 'XY' if supported_group == group_a else 'ZW'
+
+		sample_index = None
+		idx_a = idx_b = None
+		raw_file = '{}.sex_system.raw.tsv'.format(prefix)
+		table_file = '{}.sex_system.tsv'.format(prefix)
+		summary_file = '{}.sex_system.summary.tsv'.format(prefix)
+		kmer_sig_file = '{}.sex_system.kmers.tsv'.format(prefix)
+
+		logger.info('Inferring sex system from `{}`'.format(self.matfile))
+		logger.info('Groups: {} vs {}'.format(group_a, group_b))
+		logger.info('Settings: FDR={}, min_sig_kmers={}, bootstrap={}'.format(fdr, min_sig_kmers, bootstrap))
+
+		pvals = []
+		raw_rows = 0
+		with open(raw_file, 'w') as fout:
+			fout.write('\t'.join([
+				'kmer', 'group_a_present', 'group_a_absent',
+				'group_b_present', 'group_b_absent',
+				'odds_ratio', 'p_value', 'direction',
+			]) + '\n')
+			for line, samples in self:
+				if sample_index is None:
+					sample_index = {sample: i for i, sample in enumerate(samples)}
+					missing = [sample for sample in d_groups[group_a] if sample not in sample_index]
+					missing += [sample for sample in d_groups[group_b] if sample not in sample_index]
+					if missing:
+						raise ValueError('Samples from design file were not found in matrix header: {}'.format(missing))
+					idx_a = [sample_index[sample] for sample in d_groups[group_a]]
+					idx_b = [sample_index[sample] for sample in d_groups[group_b]]
+				row = KmerMatrixLine(line=line, samples=samples)
+				kmer = row.seq
+				freqs = row.freqs
+				a_present = sum(1 for idx in idx_a if idx < len(freqs) and freqs[idx] > 0)
+				b_present = sum(1 for idx in idx_b if idx < len(freqs) and freqs[idx] > 0)
+				a_absent = len(idx_a) - a_present
+				b_absent = len(idx_b) - b_present
+				table = [[a_present, a_absent], [b_present, b_absent]]
+				try:
+					odds_ratio, p_value = stats.fisher_exact(table, alternative='two-sided')
+				except Exception:
+					odds_ratio, p_value = 1.0, 1.0
+				a_prop = a_present / float(len(idx_a))
+				b_prop = b_present / float(len(idx_b))
+				if a_prop > b_prop:
+					direction = group_a
+				elif b_prop > a_prop:
+					direction = group_b
+				else:
+					direction = 'tie'
+				pvals.append(float(p_value) if p_value is not None else 1.0)
+				fout.write('\t'.join(map(str, [
+					kmer, a_present, a_absent, b_present, b_absent,
+					odds_ratio, p_value, direction,
+				])) + '\n')
+				raw_rows += 1
+
+		qvals = bh_fdr(pvals)
+		sig_rows = []
+		with open(table_file, 'w') as fout, open(kmer_sig_file, 'w') as fsig:
+			header = [
+				'kmer', 'group_a_present', 'group_a_absent',
+				'group_b_present', 'group_b_absent',
+				'odds_ratio', 'p_value', 'q_value', 'direction',
+			]
+			fout.write('\t'.join(header) + '\n')
+			fsig.write('\t'.join(header) + '\n')
+			with open(raw_file) as fin:
+				next(fin)
+				for i, raw in enumerate(fin):
+					temp = raw.rstrip('\n').split('\t')
+					if len(temp) < 8:
+						continue
+					q_value = qvals[i]
+					row = temp[:7] + [q_value, temp[7]]
+					fout.write('\t'.join(map(str, row)) + '\n')
+					if float(q_value) <= float(fdr):
+						fsig.write('\t'.join(map(str, row)) + '\n')
+						sig_rows.append(row)
+
+		total_sig = len(sig_rows)
+		supported_group = None
+		system_call = 'NA'
+		support = 0.0
+		ci_low = ci_high = None
+		dir_counts = Counter()
+		for row in sig_rows:
+			dir_counts[row[-1]] += 1
+		if total_sig >= min_sig_kmers:
+			if dir_counts[group_a] != dir_counts[group_b]:
+				candidate_group = group_a if dir_counts[group_a] > dir_counts[group_b] else group_b
+				supported_group = candidate_group
+				support = dir_counts[candidate_group] / float(total_sig)
+				system_call = _system_from_support(candidate_group)
+				rng = np.random.default_rng(seed)
+				supports = []
+				flags = np.array([1 if row[-1] == candidate_group else 0 for row in sig_rows], dtype=float)
+				for _ in range(int(bootstrap)):
+					sample = rng.choice(flags, size=len(flags), replace=True)
+					supports.append(float(np.mean(sample)))
+				if supports:
+					ci_low, ci_high = np.percentile(supports, [2.5, 97.5]).tolist()
+
+		with open(summary_file, 'w') as fout:
+			fout.write('\t'.join(['metric', 'value']) + '\n')
+			for metric, value in [
+				('group_a', group_a),
+				('group_b', group_b),
+				('system_call', system_call),
+				('supported_group', supported_group if supported_group is not None else 'NA'),
+				('support', support),
+				('support_ci_low', ci_low if ci_low is not None else 'NA'),
+				('support_ci_high', ci_high if ci_high is not None else 'NA'),
+				('total_kmers', raw_rows),
+				('significant_kmers', total_sig),
+				('fdr', fdr),
+				('min_sig_kmers', min_sig_kmers),
+			]:
+				fout.write('\t'.join(map(str, [metric, value])) + '\n')
+
+		logger.info('Sex-system inference complete: system={}, supported_group={}, support={:.3f}, sig_kmers={}'.format(
+			system_call, supported_group, support, total_sig))
+		return {
+			'group_a': group_a,
+			'group_b': group_b,
+			'system_call': system_call,
+			'supported_group': supported_group,
+			'support': support,
+			'ci_low': ci_low,
+			'ci_high': ci_high,
+			'total_kmers': raw_rows,
+			'significant_kmers': total_sig,
+			'table_file': table_file,
+			'summary_file': summary_file,
+			'kmer_file': kmer_sig_file,
+		}
 	def to_gemma(self, prefix, tmpdir, genome=None, mapq=1):
 		iterable = ((line, samples) \
 						for line, samples in self)
@@ -520,6 +794,233 @@ candidate (freq > 0) kmers'.format(remain, remain/i, min_freq, total, total/i))
 			fout.write( '\t'.join(line) + '\n')
 	def heatmap(self, matfile, **kargs):
 		_heatmap(matfile, **kargs)
+
+def parse_lower_count(value):
+	"""Normalize lower_count input.
+
+	Accepts integers or the string ``auto``.
+	"""
+	if value is None:
+		return None
+	if isinstance(value, int):
+		return value
+	if isinstance(value, float):
+		return int(value)
+	value = str(value).strip()
+	if not value:
+		return None
+	if value.lower() == 'auto':
+		return 'auto'
+	try:
+		return int(value)
+	except ValueError:
+		return value
+
+def bh_fdr(pvals):
+	"""Benjamini-Hochberg FDR correction."""
+	p = np.asarray([1.0 if (v is None or np.isnan(v)) else float(v) for v in pvals], dtype=float)
+	n = len(p)
+	if n == 0:
+		return np.array([], dtype=float)
+	order = np.argsort(p)
+	q = np.empty(n, dtype=float)
+	prev = 1.0
+	for rank in range(n - 1, -1, -1):
+		idx = order[rank]
+		cur = p[idx] * n / float(rank + 1)
+		prev = min(prev, cur)
+		q[idx] = min(prev, 1.0)
+	return q
+
+def guess_seq_format(seqfile):
+	lower = seqfile.lower()
+	if lower.endswith(('.fq', '.fq.gz', '.fastq', '.fastq.gz')):
+		return 'fastq'
+	return 'fasta'
+
+def count_seq_bases(seqfile):
+	total = 0
+	fmt = guess_seq_format(seqfile)
+	with open(seqfile) as fin:
+		for rc in SeqIO.parse(fin, fmt):
+			total += len(rc.seq)
+	return total
+
+def get_genome_size(genome=None, genome_size=None):
+	if genome_size is not None:
+		if isinstance(genome_size, (int, float)):
+			return float(genome_size)
+		try:
+			value = str(genome_size).strip().lower()
+			units = {'k': 1e3, 'm': 1e6, 'g': 1e9, 't': 1e12}
+			if value and value[-1] in units:
+				return float(value[:-1]) * units[value[-1]]
+			return float(value)
+		except Exception:
+			return None
+	if genome:
+		return float(count_seq_bases(genome))
+	return None
+
+def estimate_coverage_lower_count(d_seqfiles, genome=None, genome_size=None,
+		divisor=4, lower_count_min=2, lower_count_max=None):
+	total_bases = 0
+	for seqfiles in d_seqfiles.values():
+		for seqfile in seqfiles:
+			total_bases += count_seq_bases(seqfile)
+	gsize = get_genome_size(genome=genome, genome_size=genome_size)
+	if not gsize:
+		return None, total_bases, gsize
+	depth = float(total_bases) / float(gsize)
+	estimate = int(round(depth / float(divisor)))
+	estimate = max(int(lower_count_min), estimate)
+	if lower_count_max is not None:
+		estimate = min(int(lower_count_max), estimate)
+	return estimate, total_bases, gsize
+
+def read_kmc_histogram(histofile):
+	hist = defaultdict(int)
+	with open(histofile) as fin:
+		for line in fin:
+			temp = line.strip().split()
+			if len(temp) < 2:
+				continue
+			try:
+				depth = int(float(temp[0]))
+				freq = int(float(temp[1]))
+			except ValueError:
+				continue
+			hist[depth] += freq
+	return hist
+
+def _smooth_histogram(hist, depth):
+	return (
+		hist.get(depth - 1, 0) + hist.get(depth, 0) + hist.get(depth + 1, 0)
+	) / 3.0
+
+def estimate_histogram_lower_count(hist_files, lower_count_min=2, lower_count_max=None,
+		search_cap=100):
+	hist = defaultdict(int)
+	for histofile in hist_files:
+		if not os.path.exists(histofile):
+			continue
+		for depth, freq in read_kmc_histogram(histofile).items():
+			hist[depth] += freq
+	if not hist:
+		return None, hist
+	max_depth = max(hist)
+	search_cap = min(int(search_cap), max_depth)
+	if search_cap < 3:
+		return None, hist
+	smooth = {depth: _smooth_histogram(hist, depth) for depth in range(1, search_cap + 2)}
+	peak_depth = max(range(1, search_cap + 1), key=lambda d: smooth.get(d, 0))
+	estimate = None
+	for depth in range(peak_depth + 1, search_cap):
+		left = smooth.get(depth - 1, 0)
+		mid = smooth.get(depth, 0)
+		right = smooth.get(depth + 1, 0)
+		if mid <= left and mid <= right:
+			estimate = depth
+			break
+	if estimate is None:
+		return None, hist
+	estimate = max(int(lower_count_min), int(estimate))
+	if lower_count_max is not None:
+		estimate = min(int(lower_count_max), estimate)
+	return estimate, hist
+
+def estimate_lower_count(d_seqfiles, outdir, k, genome=None, genome_size=None,
+		method='hybrid', divisor=4, lower_count_min=2, lower_count_max=None,
+		threads=4, overwrite=False, **kargs):
+	method = (method or 'hybrid').lower()
+	if method not in {'coverage', 'histogram', 'hybrid'}:
+		raise ValueError('Unknown lower_count_method `{}`'.format(method))
+
+	coverage_est = None
+	total_bases = None
+	gsize = None
+	if method in {'coverage', 'hybrid'}:
+		coverage_est, total_bases, gsize = estimate_coverage_lower_count(
+			d_seqfiles,
+			genome=genome,
+			genome_size=genome_size,
+			divisor=divisor,
+			lower_count_min=lower_count_min,
+			lower_count_max=lower_count_max,
+		)
+
+	hist_est = None
+	hist = None
+	if method in {'histogram', 'hybrid'}:
+		preview_kargs = dict(kargs)
+		for key in ('k', 'threads', 'lower_count', 'lower_count_method',
+				'lower_count_divisor', 'lower_count_min', 'lower_count_max',
+				'genome', 'genome_size', 'overwrite'):
+			preview_kargs.pop(key, None)
+		preview_dir = os.path.join(outdir, 'lower_count_preview')
+		mkdirs(preview_dir)
+		preview_cmds = []
+		preview_dumpfiles = []
+		for sample, seqfile in d_seqfiles.items():
+			preview_prefix = '{}_preview'.format(sample)
+			preview_output = os.path.join(preview_dir, '{}_{}.sorted'.format(preview_prefix, k))
+			dumpfile = run_kmc_sort(
+				seqfile,
+				threads=threads,
+				k=k,
+				prefix=preview_prefix,
+				outdir=preview_dir,
+				lower_count=1,
+				overwrite=overwrite,
+				**preview_kargs,
+			)
+			preview_dumpfiles += [preview_output]
+			if not os.path.exists(preview_output):
+				preview_cmds += [dumpfile]
+		if preview_cmds:
+			preview_cmd_file = os.path.join(preview_dir, 'preview_kmc.sh')
+			preview_job_args = dict(job_args)
+			preview_job_args['cpu'] = threads
+			preview_job_args['cont'] = not overwrite
+			run_job(preview_cmd_file, preview_cmds, **preview_job_args)
+		hist_files = [os.path.splitext(dumpfile)[0] + '.histo' for dumpfile in preview_dumpfiles]
+		hist_est, hist = estimate_histogram_lower_count(
+			hist_files,
+			lower_count_min=lower_count_min,
+			lower_count_max=lower_count_max,
+			search_cap=100,
+		)
+
+	if method == 'coverage':
+		final = coverage_est
+	elif method == 'histogram':
+		final = hist_est
+	else:
+		final = hist_est if hist_est is not None else coverage_est
+		if final is None:
+			final = coverage_est if coverage_est is not None else hist_est
+		if hist_est is None and coverage_est is not None:
+			final = coverage_est
+		elif coverage_est is None and hist_est is not None:
+			final = hist_est
+		elif hist_est is not None and coverage_est is not None:
+			# prefer the histogram result, but fall back to coverage if the peak is
+			# implausibly low or high.
+			if hist_est < lower_count_min:
+				final = coverage_est
+			elif lower_count_max is not None and hist_est > lower_count_max:
+				final = coverage_est
+			else:
+				final = hist_est
+
+	if final is None:
+		final = lower_count_min
+	final = int(max(int(lower_count_min), round(final)))
+	if lower_count_max is not None:
+		final = min(int(lower_count_max), final)
+	logger.info('Auto lower_count estimation: method={}, coverage={}, histogram={}, final={}'.format(
+		method, coverage_est, hist_est, final))
+	return final
 	
 def _heatmap(matfile, sg_color=None, mapfile=None, kmermapfile=None, figfmt='pdf', color=('green', 'black', 'red'), 
 		heatmap_options='scale="row", key=TRUE, density.info="density", trace="none", labRow=F, main="",xlab=""'):
@@ -607,6 +1108,19 @@ dev.off()
 	cmd = 'Rscript ' + rsrc_file
 	run_cmd(cmd, log=True)
 	return outfig
+
+def resolve_matrixer(bin='matrixer'):
+	"""Resolve the matrixer executable without requiring manual PATH edits."""
+	if os.path.isabs(bin) and os.path.exists(bin):
+		return bin
+	found = shutil.which(bin)
+	if found:
+		return found
+	package_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+	local_bin = os.path.join(package_root, 'bin', 'matrixer')
+	if os.path.exists(local_bin):
+		return local_bin
+	return bin
 		
 def _filter_kmer(arg):
 	(kmer, counts, d_lens, sgs, outfig, by_count, 
@@ -730,6 +1244,7 @@ def run_kmc_sort(seqfile, threads=4, k=25, prefix=None, outdir='.',
 	return output
 
 def kmc_matrix(dbs, samples=None, outMat=None, bin='matrixer',  overwrite=False):
+	bin = resolve_matrixer(bin)
 	ckp_file = outMat + '.ok'
 	if not overwrite and check_ckp(ckp_file):
 		pass
@@ -758,12 +1273,37 @@ job_args = {
 	'mem': '100g',
 	'template': 'if [ $SGE_TASK_ID -eq {id} ]; then\n{cmd}\nfi',
 	}
-def run_kmc_dict(d_seqfiles, outdir='.', overwrite=False, **kargs):
+def run_kmc_dict(d_seqfiles, outdir='.', overwrite=False, lower_count=3,
+		lower_count_method='hybrid', lower_count_divisor=4, lower_count_min=2,
+		lower_count_max=None, genome=None, genome_size=None, **kargs):
+	lower_count = parse_lower_count(lower_count)
+	if lower_count == 'auto':
+		preview_kargs = dict(kargs)
+		for key in ('k', 'threads', 'lower_count', 'lower_count_method',
+				'lower_count_divisor', 'lower_count_min', 'lower_count_max',
+				'genome', 'genome_size', 'overwrite'):
+			preview_kargs.pop(key, None)
+		kmer_size = kargs.get('k', 31)
+		lower_count = estimate_lower_count(
+			d_seqfiles,
+			outdir=outdir,
+			k=kmer_size,
+			genome=genome,
+			genome_size=genome_size,
+			method=lower_count_method,
+			divisor=lower_count_divisor,
+			lower_count_min=lower_count_min,
+			lower_count_max=lower_count_max,
+			threads=kargs.get('threads', 4),
+			overwrite=overwrite,
+			**preview_kargs,
+		)
 	dumpfiles = []
 	histofiles = []
 	cmds = []
 	for sample, seqfile in d_seqfiles.items():
-		cmd = run_kmc_sort(seqfile, prefix=sample, outdir=outdir, overwrite=overwrite, **kargs)
+		cmd = run_kmc_sort(seqfile, prefix=sample, outdir=outdir, overwrite=overwrite,
+				lower_count=lower_count, **kargs)
 		if not os.path.exists(cmd):
 			cmds += [cmd]
 	cmd_file = '{}/run_kmc.sh'.format(outdir)
@@ -773,7 +1313,8 @@ def run_kmc_dict(d_seqfiles, outdir='.', overwrite=False, **kargs):
 	
 	for sample, seqfile in d_seqfiles.items():
 		#logger.info('Count kmers of ' + sample)
-		dumpfile = run_kmc_sort(seqfile, prefix=sample, outdir=outdir, overwrite=0, **kargs)
+		dumpfile = run_kmc_sort(seqfile, prefix=sample, outdir=outdir, overwrite=0,
+				lower_count=lower_count, **kargs)
 		dumpfiles += [dumpfile]
 		histofile = os.path.splitext(dumpfile)[0] + '.histo'
 		histofiles += [histofile]

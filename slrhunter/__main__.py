@@ -34,6 +34,8 @@ def makeArgparse():
 					help="sample design file [required]")
 	group_in.add_argument('-g',  dest='genome', default=None, metavar='FILE',
 					help="genome fasta file")
+	group_in.add_argument('-genome_size', default=None, metavar='SIZE',
+					help="Genome size used for automatic lower_count estimation (accepts numeric values or mem-like suffixes such as 1.2g)")
 	group_in.add_argument('-subset',  metavar='FILE',
 					help="subset of sample design file")
 
@@ -55,12 +57,23 @@ def makeArgparse():
 					 help="Use sub-maximum (1) or minimum (-1) as the baseline of fold \
 [default=%(default)s]")
 
-	group_kmer.add_argument('-lower_count', type=int, default=3, metavar='INT',
-					 help="Don't output k-mer with count < lower-count [default=%(default)s]")
+	group_kmer.add_argument('-lower_count', default='3', metavar='INT|auto',
+					 help="Don't output k-mer with count < lower-count; use `auto` to estimate it [default=%(default)s]")
+	group_kmer.add_argument('-lower_count_method', default='hybrid',
+					choices=['coverage', 'histogram', 'hybrid'],
+					help="Automatic lower_count strategy [default=%(default)s]")
+	group_kmer.add_argument('-lower_count_divisor', type=float, default=4.0, metavar='FLOAT',
+					help="Divide estimated coverage by this value when using the coverage method [default=%(default)s]")
+	group_kmer.add_argument('-lower_count_min', type=int, default=2, metavar='INT',
+					help="Minimum lower_count allowed for automatic estimation [default=%(default)s]")
+	group_kmer.add_argument('-lower_count_max', type=int, default=None, metavar='INT',
+					help="Maximum lower_count allowed for automatic estimation [default=%(default)s]")
 	group_kmer.add_argument('-low_mem', action="store_true", default=None,
 					help="Low MEMory but slower [default: True if genome size > 3G, else False]")
 	group_kmer.add_argument('-by_count', action="store_true", default=False,
 					help="Calculate fold by count instead of by proportion [default=%(default)s]")
+	group_kmer.add_argument('-min_maf', type=float, default=0.1, metavar='FLOAT',
+					help="Minimum minor allele frequency used when filtering the k-mer matrix [default=%(default)s]")
 	group_kmer.add_argument('-mapq', type=int, default=0, metavar='INT',
                      help="Minimum mapping quality of kmers, 1 to remove multiple hits [default=%(default)s]")
 
@@ -121,6 +134,36 @@ of `gplots` package) [default="%(default)s"]')
 	group_other.add_argument('-overwrite', action="store_true", default=False,
 					help="Overwrite even if check point files existed [default=%(default)s]")
 	group_other.add_argument('-v', '-version', action='version', version=version)
+
+	group_spec = parser.add_argument_group('Specific FASTA', 'Options to export group-specific k-mer FASTA files')
+	group_spec.add_argument('-specific_fasta', '-specific_fa', action='store_true', default=False,
+					help="Export group-specific FASTA/list files from the filtered k-mer matrix [default=%(default)s]")
+	group_spec.add_argument('-specific_groups', nargs=2, metavar=('GROUP_A', 'GROUP_B'), default=None,
+					help="Two group labels used for specific FASTA output [default=%(default)s]")
+	group_spec.add_argument('-specific_presence_cut', type=float, default=0.0, metavar='FLOAT',
+					help="Value above which a sample is counted as present [default=%(default)s]")
+	group_spec.add_argument('-specific_present_prop', type=float, default=0.70, metavar='FLOAT',
+					help="Minimum present proportion in the target group [default=%(default)s]")
+	group_spec.add_argument('-specific_absent_prop', type=float, default=0.10, metavar='FLOAT',
+					help="Maximum present proportion allowed in the opposite group [default=%(default)s]")
+	group_spec.add_argument('-specific_gzip_out', action="store_true", default=False,
+					help="Write specific FASTA/list files as .gz [default=%(default)s]")
+	group_spec.add_argument('-specific_progress', type=int, default=1000000, metavar='INT',
+					help="Report progress every N kmers [default=%(default)s]")
+
+	group_sex = parser.add_argument_group('Sex system', 'Options to infer XY/ZW support from k-mer presence/absence patterns')
+	group_sex.add_argument('-sex_system', action='store_true', default=False,
+					help="Infer sex system support from k-mer distribution [default=%(default)s]")
+	group_sex.add_argument('-sex_groups', nargs=2, metavar=('GROUP_A', 'GROUP_B'), default=None,
+					help="Two group labels to compare for sex-system inference [default=%(default)s]")
+	group_sex.add_argument('-sex_fdr', type=float, default=0.05, metavar='FLOAT',
+					help="FDR cutoff for sex-system inference [default=%(default)s]")
+	group_sex.add_argument('-sex_min_sig_kmers', type=int, default=20, metavar='INT',
+					help="Minimum number of significant k-mers required to call a system [default=%(default)s]")
+	group_sex.add_argument('-sex_bootstrap', type=int, default=1000, metavar='INT',
+					help="Bootstrap replicates for support interval [default=%(default)s]")
+	group_sex.add_argument('-sex_seed', type=int, default=1, metavar='INT',
+					help="Random seed for bootstrap resampling [default=%(default)s]")
 	
 	args = parser.parse_args()
 	if args.prefix is not None:
@@ -143,6 +186,14 @@ class Pipeline:
 		self.__dict__.update(**kargs)
 		if self.subset:
 			self.subset = Design(self.subset).samples
+			subset_set = set(self.subset)
+			self.grouped = OrderedDict(
+				(group, [sample for sample in samples if sample in subset_set])
+				for group, samples in self.grouped.items()
+				if any(sample in subset_set for sample in samples)
+			)
+			self.groups = self.grouped.keys()
+			self.grouped_samples = self.grouped.values()
 			
 		self.kargs = kargs
 
@@ -168,6 +219,11 @@ class Pipeline:
 		logger.info('Counting kmer by KMC')
 		merged_dumpfile, total_kmers = run_kmc_dict(self.sd.datafile_dict, 
 						k=self.k, lower_count=self.lower_count,
+						lower_count_method=self.lower_count_method,
+						lower_count_divisor=self.lower_count_divisor,
+						lower_count_min=self.lower_count_min,
+						lower_count_max=self.lower_count_max,
+						genome=self.genome, genome_size=self.genome_size,
 						outdir=outdir, threads=self.ncpu, overwrite=self.overwrite)	# ckp for each sample
 		logger.info('Total kmers: {}'.format(total_kmers))
 
@@ -185,17 +241,63 @@ class Pipeline:
 
 		ckp_file = self.mk_ckpfile(matfile)
 		ckp = check_ckp(ckp_file)
+		raw_mat = None
 		if self.overwrite or not ckp or not test_s(matfile):
-			mat = KmerMatrix(merged_dumpfile, ncpu=self.ncpu,method=self.pool_method, chunksize=chunksize)
+			raw_mat = KmerMatrix(merged_dumpfile, ncpu=self.ncpu,method=self.pool_method, chunksize=chunksize)
 			with open(matfile, 'w') as fout:
-				mat.filter(fout, 
+				raw_mat.filter(fout, 
 					subset=self.subset, d_groups=self.grouped, 
 					min_mean_freq=1, max_missing_rate=0.3, by_group=True, 
-					min_maf=0.1)
+					min_maf=self.min_maf)
 			mk_ckp(ckp_file, self.subset)
 		#else:
 		#	d_kmers, = ckp
 		mat = KmerMatrix(matfile, ncpu=self.ncpu,method=self.pool_method, chunksize=chunksize)
+		sex_mat = None
+		if self.sex_system:
+			sex_matfile = self.para_prefix + '.sex.kmer.mat'
+			sex_ckp_file = self.mk_ckpfile(sex_matfile)
+			if self.overwrite or not check_ckp(sex_ckp_file) or not test_s(sex_matfile):
+				if raw_mat is None:
+					raw_mat = KmerMatrix(merged_dumpfile, ncpu=self.ncpu, method=self.pool_method, chunksize=chunksize)
+				with open(sex_matfile, 'w') as fout:
+					raw_mat.filter(fout,
+						subset=self.subset, d_groups=self.grouped,
+						min_mean_freq=1, max_missing_rate=0.3, by_group=True,
+						min_maf=0.0)
+				mk_ckp(sex_ckp_file, self.subset)
+			sex_mat = KmerMatrix(sex_matfile, ncpu=self.ncpu, method=self.pool_method, chunksize=chunksize)
+		if self.specific_fasta:
+			specific_groups = self.specific_groups
+			if specific_groups is None:
+				if len(self.grouped) != 2:
+					raise ValueError('`-specific_fasta` requires exactly 2 groups in the design file, or set `-specific_groups` explicitly')
+				specific_groups = list(self.grouped.keys())
+			mat.to_specific_fasta(
+				self.grouped,
+				prefix=self.para_prefix,
+				groups=specific_groups,
+				presence_cut=self.specific_presence_cut,
+				present_prop=self.specific_present_prop,
+				absent_prop=self.specific_absent_prop,
+				gzip_out=self.specific_gzip_out,
+				progress=self.specific_progress,
+			)
+		if self.sex_system:
+			sex_groups = self.sex_groups
+			if sex_groups is None:
+				if len(self.grouped) != 2:
+					raise ValueError('`-sex_system` requires exactly 2 groups in the design file, or set `-sex_groups` explicitly')
+				sex_groups = list(self.grouped.keys())
+			sex_mat.infer_sex_system(
+				self.grouped,
+				prefix=self.para_prefix,
+				groups=sex_groups,
+				fdr=self.sex_fdr,
+				min_sig_kmers=self.sex_min_sig_kmers,
+				bootstrap=self.sex_bootstrap,
+				seed=self.sex_seed,
+			)
 		logger.info('Generating data for GEMMA')
 		mat.to_gemma(matfile, tmpdir=self.tmpdir, genome=self.genome, mapq=self.mapq)
 		
@@ -480,4 +582,3 @@ def main():
 
 if __name__ == '__main__':
 	main()
-
